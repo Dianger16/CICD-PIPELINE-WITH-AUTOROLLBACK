@@ -23,10 +23,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
@@ -59,23 +59,21 @@ jobs:
 
     outputs:
       image_tag: ${{ steps.tag.outputs.tag }}
-      full_image: ${{ steps.tag.outputs.full_image }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Generate image tag
         id: tag
         run: |
-          TAG="${GITHUB_SHA::8}"
+          TAG="${GITHUB_SHA:0:8}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Verified tag: ${TAG}"
+          cat "$GITHUB_OUTPUT"
 
-          FULL_IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${TAG}"
-
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "full_image=$FULL_IMAGE" >> $GITHUB_OUTPUT
-
-          echo "Using image: $FULL_IMAGE"
+      - name: Verify tag output
+        run: echo "Tag from output = ${{ steps.tag.outputs.tag }}"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -83,18 +81,14 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t ${{ steps.tag.outputs.full_image }} \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
-            ./app
-
-      - name: Push Docker images
-        run: |
-          docker push ${{ steps.tag.outputs.full_image }}
-
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
 
   # =========================================================
   # JOB 3 — DEPLOY + AUTO ROLLBACK
@@ -109,7 +103,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Copy deployment scripts to EC2
         uses: appleboy/scp-action@v0.1.7
@@ -117,17 +111,22 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-
           source: "scripts/"
           target: "/home/${{ secrets.EC2_USER }}/cicd-demo"
 
       - name: Deploy application on EC2
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          APP_PORT: ${{ env.APP_PORT }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-
+          envs: IMAGE_TAG,DOCKERHUB_USERNAME,IMAGE_NAME,CONTAINER_NAME,APP_PORT
           script: |
             set -e
 
@@ -136,21 +135,23 @@ jobs:
             chmod +x scripts/deploy_ec2.sh
             chmod +x scripts/health_check.sh
 
+            FULL_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+            echo "Image tag : ${IMAGE_TAG}"
+            echo "Full image: ${FULL_IMAGE}"
+
             bash scripts/deploy_ec2.sh \
-              "dianger16/ci-cd-demo:${{ github.sha }}" \
-              "${{ github.sha }}" \
-              "cicd-demo-app" \
-              "3000"
-              
+              "${FULL_IMAGE}" \
+              "${IMAGE_TAG}" \
+              "${CONTAINER_NAME}" \
+              "${APP_PORT}"
 
       - name: Deployment success notification
         if: success()
         run: |
-          echo "::notice::Deployment successful!"
-          echo "::notice::Version: ${{ needs.build.outputs.image_tag }}"
+          echo "::notice::Deployment successful! Version: ${{ needs.build.outputs.image_tag }}"
 
       - name: Deployment failed notification
         if: failure()
         run: |
-          echo "::error::Deployment failed!"
-          echo "::error::Auto rollback executed on EC2."
+          echo "::error::Deployment failed — auto rollback executed on EC2."
